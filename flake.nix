@@ -47,61 +47,140 @@
         }
       ) manifest;
     in
-    flake-parts.lib.mkFlake { inherit inputs; } {
-      systems = builtins.filter (
-        system: builtins.hasAttr system nixpkgs.legacyPackages
-      ) nixpkgs.lib.platforms.all;
-      flake = {
-        overlays = {
-          default = overlay;
-        };
-        modules = lib.genAttrs [ "nixos" "homeManager" "darwin" ] (_: {
-          default = {
-            nixpkgs.overlays = [ overlay ];
-          };
-        });
-        repos = lib.mapAttrs (
-          name: _:
-          let
-            r = repos.${name};
-          in
+    flake-parts.lib.mkFlake { inherit inputs; } (
+      { moduleLocation, ... }:
+      let
+        inherit (lib)
+          mapAttrs
+          mkOption
+          types
+          ;
+        inherit (lib.strings) escapeNixIdentifier;
+
+        # Inlined from flake-parts' module publication helper because we need
+        # the same behavior under flake.repos.<name>.modules rather than
+        # flake.modules.
+        # Ref: https://github.com/hercules-ci/flake-parts/blob/f20dc5d9b8027381c474144ecabc9034d6a839a3/extras/modules.nix
+        addRepoModuleInfo =
+          repoName: class: moduleName: module:
+          { ... }:
           {
-            modules = {
-              nixos = r.nixosModules or r.modules or { };
-              homeManager = r.homeModules or { };
-              darwin = r.darwinModules or { };
-              flake = r.flakeModules or { };
+            _class = class;
+            _file = "${toString moduleLocation}#repos.${escapeNixIdentifier repoName}.modules.${escapeNixIdentifier class}.${escapeNixIdentifier moduleName}";
+            imports = [ module ];
+          };
+
+        repoModuleOption =
+          repoName: class:
+          mkOption {
+            type = types.lazyAttrsOf types.deferredModule;
+            default = { };
+            description = "Published ${class} modules for repo `${repoName}`.";
+            apply = mapAttrs (addRepoModuleInfo repoName class);
+          };
+
+        # Inlined from flake-parts' flake.overlays option so repos.<name>.overlays
+        # uses the same named-overlay contract and merge behavior.
+        # Ref: https://github.com/hercules-ci/flake-parts/blob/f20dc5d9b8027381c474144ecabc9034d6a839a3/modules/overlays.nix
+        repoOverlayType = types.uniq (
+          types.functionTo (types.functionTo (types.lazyAttrsOf types.unspecified))
+        );
+      in
+      {
+        options = {
+          flake.repos = mkOption {
+            type = types.lazyAttrsOf (
+              types.submodule (
+                { name, ... }:
+                {
+                  options = {
+                    modules = {
+                      nixos = repoModuleOption name "nixos";
+                      homeManager = repoModuleOption name "homeManager";
+                      darwin = repoModuleOption name "darwin";
+                      flake = repoModuleOption name "flake";
+                    };
+                    overlays = mkOption {
+                      # uniq -> ordered: https://github.com/NixOS/nixpkgs/issues/147052
+                      # also update description when done
+                      type = types.lazyAttrsOf repoOverlayType;
+                      # This eta expansion exists for the sole purpose of making nix flake check happy.
+                      apply = mapAttrs (_k: f: final: prev: f final prev);
+                      default = { };
+                      description = ''
+                        Named overlays published by the repo.
+
+                        The overlays themselves are not mergeable. While overlays
+                        can be composed, the order of composition is significant,
+                        but the module system does not guarantee sufficiently
+                        deterministic definition ordering, across versions and
+                        when changing `imports`.
+                      '';
+                    };
+                  };
+                }
+              )
+            );
+            default = { };
+            description = ''
+              Published repository metadata for NUR repos.
+
+              Each repo exposes typed `modules` and `overlays` attributes.
+            '';
+          };
+        };
+
+        config = {
+          systems = builtins.filter (
+            system: builtins.hasAttr system nixpkgs.legacyPackages
+          ) nixpkgs.lib.platforms.all;
+          flake = {
+            overlays = {
+              default = overlay;
             };
-            overlays = r.overlays or { };
-          }
-        ) manifest;
-      };
-      imports = [
-        inputs.flake-parts.flakeModules.modules
-      ];
-      perSystem =
-        { pkgs, ... }:
-        {
-          formatter = pkgs.treefmt.withConfig {
-            runtimeInputs = with pkgs; [
-              nixfmt-rfc-style
-            ];
+            modules = lib.genAttrs [ "nixos" "homeManager" "darwin" ] (_: {
+              default = {
+                nixpkgs.overlays = [ overlay ];
+              };
+            });
+            repos = lib.mapAttrs (name: r: {
+              modules = {
+                nixos = r.nixosModules or r.modules or { };
+                homeManager = r.homeModules or { };
+                darwin = r.darwinModules or { };
+                flake = r.flakeModules or { };
+              };
+              overlays = r.overlays or { };
+            }) repos;
+          };
+          perSystem =
+            { pkgs, ... }:
+            {
+              formatter = pkgs.treefmt.withConfig {
+                runtimeInputs = with pkgs; [
+                  nixfmt-rfc-style
+                ];
 
-            settings = {
-              on-unmatched = "info";
-              tree-root-file = "flake.nix";
+                settings = {
+                  on-unmatched = "info";
+                  tree-root-file = "flake.nix";
 
-              formatter = {
-                nixfmt = {
-                  command = "nixfmt";
-                  includes = [ "*.nix" ];
+                  formatter = {
+                    nixfmt = {
+                      command = "nixfmt";
+                      includes = [ "*.nix" ];
+                    };
+                  };
                 };
               };
+              # legacyPackages is used because nur is a package set
+              # This trick with the overlay is used because it allows NUR packages to depend on other NUR packages
+              legacyPackages = (pkgs.extend overlay).nur;
             };
-          };
-          # legacyPackages is used because nur is a package set
-          # This trick with the overlay is used because it allows NUR packages to depend on other NUR packages
-          legacyPackages = (pkgs.extend overlay).nur;
         };
-    };
+        imports = [
+          inputs.flake-parts.flakeModules.modules
+        ];
+      }
+    );
 }
